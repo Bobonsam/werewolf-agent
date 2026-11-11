@@ -1,38 +1,30 @@
 #!/usr/bin/env python3
-"""Werewolf agent for make.fun bounty werewolf-agent-01.
+"""Werewolf agent (rule-based, stdlib only) for make.fun bounty werewolf-agent-01.
 
-Pure heuristic play: no model calls, no API keys, standard library only.
-Deterministic: every choice is a function of the trial seed, the game number
-and the view the env served (seeded xoshiro256** RNG; no wall clock, no
-unseeded randomness, no dict-order dependence).
+Fresh rebuild. Plays 30 games per trial against 7 house players through the
+env at MAKEFUN_ENV_URL. No model calls, no wall clock, no unseeded randomness:
+every choice is a deterministic function of (MAKEFUN_TRIAL_SEED, game number,
+the view served by the env). Run as: python3 -P -s main.py
 
-Strategy (per game, rebuilt from the view's log on every decision):
-- Suspicion model: votes for exiled villagers/wolves, accusations that
-  proved right/wrong, seer claims verified or contradicted, defenses of
-  revealed wolves, quietness. Seer results override everything.
-- Village: vote the most suspicious; join a plurality only when its leader
-  is a plausible wolf (never help exile a trusted villager); as seer, check
-  the most suspicious and reveal a wolf result at once; as doctor, protect
-  the seer claimant / confirmed villagers / loud accusers.
-- Wolf: blend in (accuse villagers with plausible reasons, bandwagon),
-  coordinate kills (match the partner's pick; first voter picks the most
-  obvious target), kill seer claimants first, never accuse the partner,
-  bus the partner only when they are doomed.
-- Statements are short, consistent and evidence-based; contradictions are
-  avoided by deriving every statement from the same log-derived state.
-
-Run by the grader as: python3 -P -s /bot/main.py
-Env: MAKEFUN_PROMPT_FILE, MAKEFUN_TRIAL_SEED, MAKEFUN_ENV_URL.
+Strategy (proven locally in an earlier build, re-implemented here):
+- Parse the full public log every decision into a suspicion score per seat.
+- Seer claims are first-class evidence: a lone seer claim naming a wolf is
+  echoed and voted; conflicting claims are weaker; proven liars are ignored.
+- Village abstains on weak evidence instead of exiling a random villager,
+  except to tie/block a bad exile, or when few players are left.
+- Seer checks the most suspicious unchecked player and reveals wolf results.
+- Doctor protects the seer claimant first, then the loudest accuser.
+- Wolf matches the partner's kill, kills seer claimants first, votes the
+  most exilable villager, and buses a doomed partner only.
 """
 import hashlib
 import json
 import os
 import re
 import sys
-import urllib.error
 import urllib.request
+import urllib.error
 
-# ---------------------------------------------------------------- seeded RNG
 _MASK64 = (1 << 64) - 1
 
 
@@ -41,12 +33,12 @@ def _rotl(x, k):
 
 
 class Rng:
-    """xoshiro256** seeded from sha256(domain, seed, label)."""
+    """xoshiro256** seeded from sha256(domain || seed || label)."""
 
-    def __init__(self, seed, label=""):
+    def __init__(self, seed, label):
         h = hashlib.sha256(
-            b"werewolf-agent/rng/v1\x00" + str(seed).encode() + b"\x00" + str(label).encode()
-        ).digest()
+            b"werewolf-rebuild/rng/v1\x00" + str(seed).encode()
+            + b"\x00" + str(label).encode()).digest()
         s = [int.from_bytes(h[i:i + 8], "big") for i in range(0, 32, 8)]
         if not any(s):
             s[0] = 1
@@ -56,9 +48,8 @@ class Rng:
         s0, s1, s2, s3 = self._s
         result = (_rotl((s1 * 5) & _MASK64, 7) * 9) & _MASK64
         t = (s1 << 17) & _MASK64
-        a2 = s2 ^ s0
-        a3 = s3 ^ s1
-        self._s = [s0 ^ a3, s1 ^ a2, a2 ^ t, _rotl(a3, 45)]
+        self._s = [s0 ^ (s3 ^ s1), s1 ^ (s2 ^ s0),
+                   (s2 ^ s0) ^ t, _rotl(s3 ^ s1, 45)]
         return result
 
     def random(self):
@@ -75,813 +66,544 @@ class Rng:
     def choice(self, items):
         return items[self.randint(0, len(items) - 1)]
 
+    def shuffle(self, items):
+        items = list(items)
+        for i in range(len(items) - 1, 0, -1):
+            j = self.randint(0, i)
+            items[i], items[j] = items[j], items[i]
+        return items
+
 
 # ---------------------------------------------------------------- env client
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class Env:
+    def __init__(self, base_url):
+        self.base = base_url.rstrip("/")
 
-
-def env_post(env_url, path, body, timeout=65):
-    """POST one JSON object; returns (status, parsed JSON or {}). Retries once
-    on a connection failure (a request the env never saw has no effect)."""
-    data = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        env_url + path, data=data, method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
-    for attempt in range(2):
+    def _post(self, path, body):
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            self.base + path, data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with _OPENER.open(req, timeout=timeout) as res:
-                raw = res.read()
-                try:
-                    return res.status, json.loads(raw.decode("utf-8"))
-                except ValueError:
-                    return res.status, {}
-        except urllib.error.HTTPError as err:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return resp.status, json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
             try:
-                raw = err.read()
+                return e.code, json.loads(e.read().decode() or "{}")
             except Exception:
-                raw = b""
-            try:
-                return err.code, json.loads(raw.decode("utf-8"))
-            except ValueError:
-                return err.code, {}
-        except (urllib.error.URLError, OSError):
-            if attempt == 0:
-                continue
-            raise
-    raise RuntimeError("unreachable")
+                return e.code, {}
+        except Exception:
+            return 0, {}
+
+    def observe(self):
+        return self._post("/observe", {})
+
+    def act(self, game, decision, target=None, text=None, is_pass=False):
+        body = {"game": game, "decision": decision}
+        if decision == "speak":
+            if is_pass:
+                body["pass"] = True
+            else:
+                body["text"] = text
+        else:
+            body["target"] = target
+        return self._post("/act", body)
 
 
-def fold(text):
-    """Fold a statement the env's way: runs of breaks/tabs -> one space,
-    other control chars dropped, ends trimmed."""
-    t = re.sub(r"[\t\n\v\f\r\x85\u2028\u2029]+", " ", text)
-    t = "".join(c for c in t if not (ord(c) < 32 or ord(c) == 127))
-    return t.strip()
+# ---------------------------------------------------------------- state model
+SEAT_RE = re.compile(r"seat\s+(\d+)", re.I)
 
 
-def clip(text, max_chars):
-    folded = fold(text)
-    if len(folded) <= max_chars:
-        return folded
-    cut = folded[:max_chars]
-    # prefer a word boundary
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
-    return cut.strip()
+def _mentions(text):
+    return [int(m.group(1)) for m in SEAT_RE.finditer(text or "")
+            if 1 <= int(m.group(1)) <= 8]
 
 
-# ---------------------------------------------------------------- game state
-class GameState:
-    """Everything derivable from one game's view (log + private fields)."""
+class State:
+    """Everything deducible from one view: roles, log-derived evidence."""
 
-    def __init__(self, view):
+    def __init__(self, view, trial_seed, game_num=0):
         self.view = view
+        self.game_num = game_num
+        self.seed = trial_seed
         self.day = view.get("day", 1)
         self.phase = view.get("phase", "")
-        you = view.get("you") or {}
-        self.my_seat = you.get("seat")
-        self.my_name = you.get("name", "?")
-        self.my_role = you.get("role")
-        self.alive = bool(you.get("alive"))
-        self.partner = (you.get("partner") or {}).get("seat") if you.get("partner") else None
-        self.players = {p["seat"]: p for p in view.get("players", [])}
-        self.names = {s: p.get("name", f"seat {s}") for s, p in self.players.items()}
-        self.revealed = {s: p["role"] for s, p in self.players.items() if p.get("role")}
-        self.living = sorted(s for s, p in self.players.items() if p.get("alive"))
-        self.log = view.get("log", []) or []
-        self.seer_results = list(view.get("seerResults") or [])
-        self.last_protect = view.get("lastProtect")
-        self.wolf_votes = list(view.get("wolfVotes") or [])
-        self.known_wolf = set()
-        self.known_villager = set()
-        for r in self.seer_results:
-            if r.get("werewolf"):
-                self.known_wolf.add(r["seat"])
-            else:
-                self.known_villager.add(r["seat"])
+        self.you = view.get("you") or {}
+        self.me = self.you.get("seat")
+        self.role = self.you.get("role")
+        self.partner = None
+        p = self.you.get("partner")
+        if p:
+            self.partner = p.get("seat")
+        self.players = view.get("players") or []
+        self.name = {pl["seat"]: pl.get("name", "?") for pl in self.players}
+        self.alive = [pl["seat"] for pl in self.players if pl.get("alive")]
+        self.revealed = {pl["seat"]: pl.get("role") for pl in self.players
+                         if pl.get("role")}
+        self.log = view.get("log") or []
+        self.known_wolves = set()   # seats I am sure are wolves
+        self.known_villagers = set()  # seats I am sure are NOT wolves
+        self._private_knowledge()
+        self.claims = []            # seer claims: {seat, wolf_target, clear_target}
+        self.accusations = []       # (accuser, target) explicit "is a wolf"
+        self.speech_count = {}
+        self.accuse_count = {}
         self._parse_log()
+        self.suspicion = self._suspicion()
+        self.seer_claimants = [c["seat"] for c in self.claims]
 
-    # -- log parsing --------------------------------------------------
+    # -- private knowledge -------------------------------------------------
+    def _private_knowledge(self):
+        if self.role == "werewolf" and self.partner:
+            self.known_wolves.add(self.partner)
+            self.known_wolves.discard(self.me)
+        for r in (self.view.get("seerResults") or []):
+            t = r.get("seat")
+            if t is None:
+                continue
+            if r.get("werewolf"):
+                self.known_wolves.add(t)
+            else:
+                self.known_villagers.add(t)
+        for seat, role in self.revealed.items():
+            if role == "werewolf":
+                self.known_wolves.add(seat)
+            elif role:
+                self.known_villagers.add(seat)
+        self.known_wolves.discard(self.me)
+        self.known_villagers.discard(self.me)
+
+    # -- log parsing -------------------------------------------------------
     def _parse_log(self):
-        self.votes_by_day = {}        # day -> list of {seat, target}
-        self.exiles = {}              # day -> {seat, role, tally}
-        self.speeches = []            # {seat, day, round, text}
-        self.passes = []              # {seat, day, round}
-        self.deaths = {}              # day -> {seat, role}
-        self.claims = []              # {seat, day, kind: seer|doctor, target, result}
-        self.accusations = []         # {seat, day, target}
-        self.defenses = []            # {seat, day, target}
-        self.my_speeches = []
         for e in self.log:
-            k = e.get("kind")
-            d = e.get("day", 0)
-            if k == "vote":
-                self.votes_by_day.setdefault(d, []).append({"seat": e.get("seat"), "target": e.get("target")})
-            elif k == "exile":
-                if e.get("seat") is not None:
-                    self.exiles[d] = {"seat": e["seat"], "role": e.get("role"), "tally": e.get("tally") or []}
-            elif k == "speech":
-                rec = {"seat": e.get("seat"), "day": d, "round": e.get("round"), "text": e.get("text", "")}
-                self.speeches.append(rec)
-                if rec["seat"] == self.my_seat:
-                    self.my_speeches.append(rec)
-                self._parse_speech(rec)
-            elif k == "pass":
-                self.passes.append({"seat": e.get("seat"), "day": d, "round": e.get("round")})
-            elif k == "dawn":
-                if e.get("died") is not None:
-                    self.deaths[d] = {"seat": e["died"], "role": e.get("role")}
-        # claim verification: a seer claim is verified when its target is revealed
-        for c in self.claims:
-            t = c.get("target")
-            if t in self.revealed:
-                c["verified"] = (self.revealed[t] == "werewolf") if c.get("result") == "wolf" else (self.revealed[t] != "werewolf")
+            kind = e.get("kind")
+            if kind == "speech":
+                seat, text = e.get("seat"), e.get("text") or ""
+                low = text.lower()
+                self.speech_count[seat] = self.speech_count.get(seat, 0) + 1
+                is_seer = ("i am the seer" in low or "i'm the seer" in low
+                           or "i am seer" in low or "am the seer" in low)
+                wolf_t = clear_t = None
+                for m in SEAT_RE.finditer(text):
+                    t = int(m.group(1))
+                    if not (1 <= t <= 8) or t == seat:
+                        continue
+                    if "wolf" in low:
+                        # "checked seat N ... wolf" / "seat N is a wolf"
+                        wolf_t = t
+                    if ("not a wolf" in low or "is innocent" in low
+                            or "is a villager" in low or "cleared" in low
+                            or "not wolf" in low):
+                        clear_t = t
+                if is_seer:
+                    self.claims.append({"seat": seat, "wolf": wolf_t,
+                                        "clear": clear_t})
+                # explicit accusations: "seat N is a wolf" / "seat N ... wolf"
+                if "wolf" in low and not is_seer:
+                    for t in _mentions(text):
+                        if t != seat:
+                            self.accusations.append((seat, t))
+                            self.accuse_count[seat] = \
+                                self.accuse_count.get(seat, 0) + 1
+                elif "wolf" in low and is_seer and wolf_t is not None:
+                    self.accuse_count[seat] = self.accuse_count.get(seat, 0) + 1
 
-    def _seat_from_text(self, text):
-        """Find a seat referenced in a statement: 'seat N' or a player name."""
-        m = re.search(r"[Ss]eat (\d)", text)
-        if m:
-            s = int(m.group(1))
-            if 1 <= s <= 8:
-                return s
-        low = text.lower()
-        for s, name in self.names.items():
-            if name and name.lower() in low:
-                return s
+    def claimants_naming(self, target):
+        return [c for c in self.claims if c.get("wolf") == target]
+
+    def lone_seer_target(self):
+        """Target of a lone (uncontested) seer wolf-claim, else None."""
+        targets = {}
+        for c in self.claims:
+            if c.get("wolf") is not None:
+                targets.setdefault(c["wolf"], []).append(c["seat"])
+        if len(targets) == 1:
+            t = next(iter(targets))
+            if t not in self.known_villagers and t in self.alive:
+                return t
         return None
 
-    def _parse_speech(self, rec):
-        text = rec["text"]
-        low = text.lower()
-        seat = rec["seat"]
-        # seer claim (a seer statement is a claim, not a generic accusation)
-        is_seer_claim = False
-        if re.search(r"\bi am the seer\b|\bi'm the seer\b|\bseer here\b|\bi am seer\b|\bi'm seer\b|\bthe seer is me\b|\bseer role\b", low):
-            is_seer_claim = True
-            target = None
-            result = None
-            m = re.search(r"(?:check(?:ed|s)?|inspect(?:ed|s)?)\s+(?:seat\s+)?(\d)", low)
-            if m:
-                target = int(m.group(1))
-            else:
-                target = self._seat_from_text(text)
-            if "not a wolf" in low or "isn't a wolf" in low or "is not a wolf" in low or "no wolf" in low:
-                result = "villager"
-            elif "wolf" in low:
-                result = "wolf"
-            elif "villager" in low or "village" in low:
-                result = "villager"
-            self.claims.append({"seat": seat, "day": rec["day"], "kind": "seer", "target": target, "result": result})
-        elif re.search(r"\bchecked\b|\binspected\b|\blooked at\b", low):
-            is_seer_claim = True
-            target = self._seat_from_text(text)
-            if "not a wolf" in low or "isn't a wolf" in low or "is not a wolf" in low:
-                result = "villager"
-            else:
-                result = "wolf" if "wolf" in low else ("villager" if ("villager" in low or "village" in low) else None)
-            if target is not None:
-                self.claims.append({"seat": seat, "day": rec["day"], "kind": "seer", "target": target, "result": result})
-        if re.search(r"\bi am the doctor\b|\bi'm the doctor\b", low):
-            self.claims.append({"seat": seat, "day": rec["day"], "kind": "doctor", "target": None, "result": None})
-        # accusations: explicit "X is a wolf" / "vote X out" only. Softer
-        # suspicion language ("looks off", "my eyes are on") is too noisy:
-        # counting it as an accusation drowned the vote/seer signals.
-        if not is_seer_claim and "wolf" in low and (" is a wolf" in low or " is the wolf" in low or "vote seat" in low or "vote " in low):
-            t = self._seat_from_text(text)
-            if t is not None and t != seat:
-                self.accusations.append({"seat": seat, "day": rec["day"], "target": t})
-        # defenses: "trust seat N" / "N is not a wolf" / "leave N alone"
-        if re.search(r"\btrust\b|\bnot a wolf\b|\bleave .* alone\b|\bdefend\b", low):
-            t = self._seat_from_text(text)
-            if t is not None and t != seat:
-                self.defenses.append({"seat": seat, "day": rec["day"], "target": t})
-
-    # -- derived facts -------------------------------------------------
-    def trusted_seers(self):
-        """Seats whose seer claim was verified by a revealed wolf."""
-        out = set()
+    # -- suspicion ---------------------------------------------------------
+    def _suspicion(self):
+        s = {seat: 0.0 for seat in range(1, 9)}
+        weights = (1.0, 0.7, 0.5, 0.35, 0.25, 0.2)
+        # day votes grouped per exile
+        votes_by_day = {}
+        for e in self.log:
+            if e.get("kind") == "vote":
+                votes_by_day.setdefault(e.get("day"), []).append(e)
+        for e in self.log:
+            if e.get("kind") == "exile" and e.get("seat") is not None:
+                dead, role = e["seat"], e.get("role")
+                day_votes = votes_by_day.get(e.get("day"), [])
+                for i, v in enumerate(day_votes):
+                    if v.get("target") != dead:
+                        continue
+                    w = weights[min(i, len(weights) - 1)]
+                    if role == "villager":
+                        s[v["seat"]] += 3.0 * w
+                    elif role == "werewolf":
+                        s[v["seat"]] -= 3.0 * w
+                    elif role in ("seer", "doctor"):
+                        s[v["seat"]] += 3.5 * w
+        # accusations proved right / wrong by revealed roles
+        for accuser, target in self.accusations:
+            if target in self.revealed:
+                if self.revealed[target] == "werewolf":
+                    s[accuser] -= 2.0
+                else:
+                    s[accuser] += 2.0
+        # seer claims: wolf target up, proven liars up, cleared down
+        wolf_targets = {}
         for c in self.claims:
-            if c.get("kind") == "seer" and c.get("verified") is True and c.get("result") == "wolf":
-                out.add(c["seat"])
-        return out
-
-    def false_claimants(self):
-        out = set()
+            if c.get("wolf") is not None:
+                wolf_targets.setdefault(c["wolf"], []).append(c["seat"])
+        for target, claimants in wolf_targets.items():
+            boost = 4.0 if len(wolf_targets) == 1 else 2.0
+            if target in self.known_villagers:
+                boost = 0.0
+            s[target] += boost
+            # claimants whose named target turned out a villager are liars
+            if target in self.revealed and self.revealed[target] != "werewolf":
+                for cl in claimants:
+                    s[cl] += 3.0
         for c in self.claims:
-            if c.get("kind") == "seer" and c.get("verified") is False:
-                out.add(c["seat"])
-        return out
+            if c.get("clear") is not None:
+                s[c["clear"]] -= 2.0
+        # quietness from day 2 on
+        if self.day >= 2:
+            for seat in self.alive:
+                if seat != self.me and self.speech_count.get(seat, 0) == 0:
+                    s[seat] += 0.5
+        # my private knowledge overrides
+        for seat in self.known_wolves:
+            s[seat] = max(s[seat], 10.0)
+        for seat in self.known_villagers:
+            s[seat] = min(s[seat], -5.0)
+        s[self.me] = -99.0
+        if self.partner:
+            s[self.partner] = -99.0
+        return s
 
-    def seer_claimants(self):
-        return {c["seat"] for c in self.claims if c.get("kind") == "seer"}
+    # -- helpers -----------------------------------------------------------
+    def rng(self, purpose):
+        return Rng(self.seed, "g%d/%s/d%d/log%d" % (
+            self.game_num, purpose, self.day, len(self.log)))
 
-    def claimed_wolf_by_trusted(self):
-        """Wolf seats named by a verified seer claim."""
-        out = set()
-        trusted = self.trusted_seers()
-        for c in self.claims:
-            if c.get("kind") == "seer" and c.get("seat") in trusted and c.get("result") == "wolf" and c.get("target"):
-                out.add(c["target"])
-        return out
+    def living_others(self):
+        return [s for s in self.alive if s != self.me]
 
-    def claimed_villager_by_trusted(self):
-        out = set()
-        trusted = self.trusted_seers()
-        for c in self.claims:
-            if c.get("kind") == "seer" and c.get("seat") in trusted and c.get("result") == "villager" and c.get("target"):
-                out.add(c["target"])
-        return out
-
-    def i_claimed_seer(self):
-        return any(c["seat"] == self.my_seat and c.get("kind") == "seer" for c in self.claims)
-
-    def revealed_wolf_seats(self):
-        return {s for s, r in self.revealed.items() if r == "werewolf"}
-
-    def speech_count(self, seat):
-        return sum(1 for s in self.speeches if s["seat"] == seat)
-
-    def pass_count(self, seat):
-        return sum(1 for p in self.passes if p["seat"] == seat)
-
-    def wolf_mention_count(self, seat):
-        """Speeches by `seat` that name a wolf (how loud an accuser they are)."""
-        return sum(1 for s in self.speeches if s["seat"] == seat and "wolf" in s["text"].lower())
-
-    def votes_for(self, seat, day=None):
-        """Votes cast for `seat` (optionally on one day)."""
-        out = []
-        for d, vs in self.votes_by_day.items():
-            if day is not None and d != day:
-                continue
-            for v in vs:
-                if v.get("target") == seat:
-                    out.append(v)
-        return out
-
-    def current_day_votes(self):
-        return list(self.votes_by_day.get(self.day, []))
-
-
-# ---------------------------------------------------------------- suspicion
-def suspicion_scores(st, for_wolf=False):
-    """Suspicion of each living player (higher = more likely a wolf).
-    for_wolf=True scores villagers by how exilable they look to the village."""
-    scores = {s: 0.0 for s in st.living}
-    reasons = {s: [] for s in st.living}
-
-    def add(seat, pts, why):
-        if seat in scores:
-            scores[seat] += pts
-            reasons[seat].append(why)
-
-    # votes on exiled players: early votes matter most (a late bandwagon
-    # vote on a wolf is often a wolf bussing its partner, not a clear)
-    _VOTE_W = (1.0, 0.7, 0.5, 0.35, 0.25, 0.2)
-    for day, ex in sorted(st.exiles.items()):
-        dead, role = ex["seat"], ex.get("role")
-        day_votes = st.votes_by_day.get(day, [])
-        pos = 0
-        for v in day_votes:
-            if v.get("target") != dead:
-                continue
-            w = _VOTE_W[min(pos, 5)]
-            pos += 1
-            if role == "villager":
-                add(v["seat"], 3.0 * w if pos == 1 else 1.5 * w, f"voted out villager {st.names.get(dead, dead)} day {day}")
-            elif role == "werewolf":
-                add(v["seat"], -2.5 * w, f"voted out wolf {st.names.get(dead, dead)} day {day}")
-    # accusations that proved right/wrong
-    for a in st.accusations:
-        t = a["target"]
-        if t in st.revealed:
-            if st.revealed[t] == "villager":
-                add(a["seat"], 2.0, f"accused villager {st.names.get(t, t)}")
-            elif st.revealed[t] == "werewolf":
-                add(a["seat"], -2.0, f"accused wolf {st.names.get(t, t)}")
-    # defenses of revealed wolves / villagers
-    for d in st.defenses:
-        t = d["target"]
-        if t in st.revealed:
-            if st.revealed[t] == "werewolf":
-                add(d["seat"], 2.0, f"defended wolf {st.names.get(t, t)}")
-            elif st.revealed[t] == "villager":
-                add(d["seat"], -1.0, f"defended villager {st.names.get(t, t)}")
-    # seer claims: the TARGET of a claim is a suspect even before the claim
-    # is verified. A lone seer naming a wolf is usually the real seer;
-    # conflicting seer claims split the weight (one of them is lying).
-    # Claims from a proven liar are ignored.
-    false_c = st.false_claimants()
-    wolf_namers = {c["seat"] for c in st.claims
-                   if c.get("kind") == "seer" and c.get("result") == "wolf"
-                   and c.get("seat") not in false_c and c.get("target") in scores}
-    for c in st.claims:
-        if c.get("kind") != "seer":
-            continue
-        if c.get("verified") is True and c.get("result") == "wolf":
-            add(c["seat"], -3.0, "true seer claim")
-        elif c.get("verified") is False:
-            add(c["seat"], 3.0, "false seer claim")
-        if c.get("seat") in false_c:
-            continue
-        t = c.get("target")
-        if t is None or t not in scores:
-            continue
-        if c.get("result") == "wolf":
-            pts = 4.0 if len(wolf_namers) <= 1 else 2.0
-            add(t, pts, f"seer {st.names.get(c['seat'], c['seat'])} says wolf")
-        elif c.get("result") == "villager":
-            add(t, -2.0, f"seer {st.names.get(c['seat'], c['seat'])} cleared them")
-    # unresolved accusations are weak evidence against the target (capped)
-    _acc_n = {}
-    for a in st.accusations:
-        t = a["target"]
-        if t in scores and t not in st.revealed:
-            _acc_n[t] = _acc_n.get(t, 0) + 1
-    for t, n in _acc_n.items():
-        add(t, min(0.5 * n, 1.5), f"accused by {n} player(s)")
-    # votes against me (when I am village, wolves push villagers)
-    if st.my_role != "werewolf":
-        for d, vs in st.votes_by_day.items():
-            for v in vs:
-                if v.get("target") == st.my_seat:
-                    add(v["seat"], 1.0, "voted for me")
-    # quiet players are slightly suspicious after day 1
-    if st.day >= 2:
-        for s in st.living:
-            if s != st.my_seat and st.speech_count(s) == 0:
-                add(s, 0.5, "never spoke")
-            if st.pass_count(s) >= 2:
-                add(s, 0.5, "keeps passing")
-    # fine-grained tie-breakers: wolves accuse more and pass more; villagers
-    # who drove a correct exile look better. These keep exact ties rare so
-    # the ranking follows behaviour, never a seat number.
-    for s in st.living:
-        if s == st.my_seat:
-            continue
-        acc_n = sum(1 for a in st.accusations if a["seat"] == s)
-        add(s, 0.05 * acc_n, "accuses often")
-        add(s, 0.05 * st.pass_count(s), "passes often")
-    # my own seat is never a candidate
-    scores.pop(st.my_seat, None)
-    reasons.pop(st.my_seat, None)
-    # known results override
-    for s in list(scores):
-        if s in st.known_wolf or s in st.claimed_wolf_by_trusted():
-            scores[s] = 100.0
-            reasons[s] = ["seer found them a wolf"]
-        elif s in st.known_villager or s in st.claimed_villager_by_trusted():
-            scores[s] = -100.0
-            reasons[s] = ["seer cleared them"]
-    if for_wolf:
-        # as a wolf I want the most exilable villager: reuse village suspicion
-        # (how suspicious they look) and drop my partner entirely.
-        scores.pop(st.partner, None) if st.partner in scores else None
-        reasons.pop(st.partner, None) if st.partner in reasons else None
-    return scores, reasons
-
-
-def rank_suspects(st, for_wolf=False):
-    scores, reasons = suspicion_scores(st, for_wolf=for_wolf)
-    order = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    return order, scores, reasons
-
-
-# ---------------------------------------------------------------- statements
-ACCUSE_TEMPLATES = [
-    "I think seat {s} ({n}) is hiding something. {why}",
-    "Seat {s} ({n}) looks off to me. {why}",
-    "My eyes are on seat {s} ({n}). {why}",
-    "I am suspicious of seat {s} ({n}). {why}",
-    "Seat {s} ({n}) has not explained themselves. {why}",
-]
-DEFEND_TEMPLATES = [
-    "I do not think seat {s} ({n}) is a wolf. {why}",
-    "Leave seat {s} ({n}) alone for now, look at seat {o} instead.",
-    "Seat {s} ({n}) has voted with the village. I trust them for now.",
-]
-NEUTRAL_TEMPLATES = [
-    "No one has claimed anything yet. I am watching how everyone votes.",
-    "Let us not rush. A wrong vote today only helps the wolves.",
-    "I am listening. Say what you saw last night, if anything.",
-]
-NO_DEATH_TEMPLATES = [
-    "No one died last night. The doctor saved someone, or the wolves missed.",
-    "A quiet night. That tells us nothing yet, so let us talk.",
-]
-DAY1_TEMPLATES = [
-    "Seat {d} died last night and they were village. Someone here did that.",
-    "First day. I have no proof yet, but I am watching seat {s} ({n}).",
-    "The wolves struck seat {d}. Let us talk before we vote anyone out.",
-]
-DAY1_NO_DEATH = [
-    "First day, and no one died. Let us talk before anyone votes.",
-    "No one died last night. I have no proof yet, so I am listening.",
-]
-REVEAL_TEMPLATES = [
-    "I am the seer. I checked seat {s} ({n}) last night: wolf. Vote seat {s} out.",
-    "I am the seer. Seat {s} ({n}) is a wolf, I checked them. Vote them out now.",
-    "Listen: I am the seer, and seat {s} ({n}) is a wolf. Do not waste this vote.",
-]
-
-
-def reason_text(st, seat, reasons):
-    rs = reasons.get(seat) or []
-    if not rs:
-        return "Their votes do not add up."
-    r = rs[0]
-    # turn the reason into a sentence
-    if r.startswith("voted out villager"):
-        m = re.search(r"day (\d+)", r)
-        return f"They voted out a villager on day {m.group(1)}." if m else "They voted out a villager."
-    if r.startswith("voted out wolf"):
-        return "They helped vote out a wolf, I will give them that."
-    if r.startswith("accused villager"):
-        return "They accused a villager who turned out innocent."
-    if r.startswith("accused wolf"):
-        return "They called out a wolf before anyone else did."
-    if r.startswith("defended wolf"):
-        return "They defended someone who turned out to be a wolf."
-    if r.startswith("false seer claim"):
-        return "They claimed to be the seer and were wrong."
-    if r.startswith("voted for me"):
-        return "They voted for me, and I am no wolf."
-    if r == "never spoke":
-        return "They have said almost nothing."
-    if r == "keeps passing":
-        return "They keep passing instead of speaking."
-    if r == "seer found them a wolf":
-        return "The seer found them a wolf."
-    return "Their votes do not add up."
-
-
-# ---------------------------------------------------------------- agent
-class Agent:
-    def __init__(self, env_url, seed):
-        self.env_url = env_url
-        self.seed = seed
-        self.decisions = 0
-        self.fallbacks = 0
-
-    def rng(self, game, label):
-        return Rng(self.seed, f"g{game}:{label}")
-
-    # -- main loop ------------------------------------------------------
-    def run(self):
-        while True:
-            status, obs = env_post(self.env_url, "/observe", {})
-            if status != 200 or not isinstance(obs, dict):
-                raise RuntimeError(f"/observe answered {status}")
-            if obs.get("done"):
-                break
-            pending = obs.get("pending") or []
-            for p in pending:
-                self.answer(p)
-        return self.decisions, self.fallbacks
-
-    def answer(self, p):
-        game = p.get("game")
-        kind = p.get("decision")
-        view = p.get("view") or {}
-        st = GameState(view)
-        act = self.decide(p, st)
-        status, _ = env_post(self.env_url, "/act", act, timeout=30)
-        self.decisions += 1
-        if status == 200:
-            return
-        if status == 409:
-            return  # already answered / moved on
-        # refusal: fall back to pass/abstain once
-        self.fallbacks += 1
-        fb = {"game": game, "decision": kind}
-        if kind == "speak":
-            fb["pass"] = True
-        else:
-            fb["target"] = None
-        env_post(self.env_url, "/act", fb, timeout=30)
-
-    # -- dispatch ---------------------------------------------------------
-    def decide(self, p, st):
-        kind = p.get("decision")
-        game = p.get("game")
-        if kind == "speak":
-            return self.decide_speak(p, st)
-        if kind == "vote":
-            return self.decide_vote(p, st)
-        if kind == "kill":
-            return self.decide_kill(p, st)
-        if kind == "protect":
-            return self.decide_protect(p, st)
-        if kind == "inspect":
-            return self.decide_inspect(p, st)
-        return {"game": game, "decision": kind, "target": None}
-
-    # -- speak ------------------------------------------------------------
-    def decide_speak(self, p, st):
-        game = p.get("game")
-        max_chars = p.get("max_chars") or 500
-        rng = self.rng(game, f"speak-d{st.day}-r{self._round_of(st)}")
-        text = None
-        if st.my_role == "werewolf":
-            text = self._speak_wolf(st, rng)
-        elif st.my_role == "seer":
-            text = self._speak_seer(st, rng)
-        else:
-            text = self._speak_village(st, rng)
-        if not text:
-            return {"game": game, "decision": "speak", "pass": True}
-        return {"game": game, "decision": "speak", "text": clip(text, max_chars)}
-
-    def _round_of(self, st):
-        # current debate round: count my speeches today +1, else derive from log
-        mine_today = [s for s in st.speeches if s["seat"] == st.my_seat and s["day"] == st.day]
-        return len(mine_today) + 1
-
-    def _speak_village(self, st, rng):
-        order, scores, reasons = rank_suspects(st)
-        # defend myself when under attack
-        self_def = self._defend_self(st, rng)
-        if self_def:
-            return self_def
-        # echo a lone seer wolf claim: the village must act on it
-        unverified = {}
-        for c in st.claims:
-            if (c.get("kind") == "seer" and c.get("result") == "wolf"
-                    and c.get("target") in st.living and c.get("target") != st.my_seat
-                    and c.get("seat") not in st.false_claimants()
-                    and c.get("verified") is not True):
-                unverified.setdefault(c["target"], c["seat"])
-        if len(unverified) == 1:
-            t, claimer = next(iter(unverified.items()))
-            return (f"Seat {claimer} says they are the seer and checked seat {t} "
-                    f"({st.names.get(t, t)}): wolf. I believe them. Vote seat {t} out.")
-        # defend a likely villager being pushed, if any
-        for s in st.living:
-            if scores.get(s, 0) <= -1.0 and len(st.votes_for(s, st.day)) >= 1:
-                others = [x for x, _ in order if x != s]
-                o = others[0] if others else None
-                if o is not None:
-                    return rng.choice(DEFEND_TEMPLATES).format(s=s, n=st.names.get(s, s), o=o, why=reason_text(st, s, reasons))
-        if not order:
-            return self._neutral(st, rng)
-        top, top_score = order[0]
-        if top_score >= 1.0:
-            return rng.choice(ACCUSE_TEMPLATES).format(s=top, n=st.names.get(top, top), why=reason_text(st, top, reasons))
-        if top_score >= -0.5 and st.day >= 2:
-            return rng.choice(ACCUSE_TEMPLATES).format(s=top, n=st.names.get(top, top), why=reason_text(st, top, reasons))
-        return self._neutral(st, rng)
-
-    def _defend_self(self, st, rng):
-        """Defend myself when accused or voted for; returns a statement or None."""
-        accusers = set()
-        for e in st.speeches:
-            if e["seat"] == st.my_seat or e["day"] != st.day:
-                continue
-            if st._seat_from_text(e["text"]) == st.my_seat and "wolf" in e["text"].lower():
-                accusers.add(e["seat"])
-        votes_me = len(st.votes_for(st.my_seat, st.day))
-        if len(accusers) < 1 and votes_me < 1:
+    def top_suspect(self, exclude=None):
+        exclude = set(exclude or [])
+        cands = [s for s in self.alive
+                 if s != self.me and s not in exclude and s != self.partner]
+        if not cands:
             return None
-        # cite my best record: a wolf I helped exile
-        for day, ex in sorted(st.exiles.items()):
-            if ex.get("role") == "werewolf":
-                mine = [v for v in st.votes_by_day.get(day, []) if v.get("seat") == st.my_seat and v.get("target") == ex["seat"]]
-                if mine:
-                    return f"I am no wolf. I voted out {st.names.get(ex['seat'], ex['seat'])} on day {day}, and they were a wolf. Look elsewhere."
-        return "I am no wolf. I have voted with the village every day. Check my votes, then look at who is pushing me."
+        best = max(self.suspicion[s] for s in cands)
+        tops = [s for s in cands if self.suspicion[s] == best]
+        if len(tops) == 1:
+            return tops[0]
+        return self.rng("tie").choice(sorted(tops))
 
-    def _speak_seer(self, st, rng):
-        # reveal an unrevealed wolf result
-        for r in st.seer_results:
-            if r.get("werewolf") and r["seat"] in st.living and not self._already_revealed(st, r["seat"]):
-                t = r["seat"]
-                return rng.choice(REVEAL_TEMPLATES).format(s=t, n=st.names.get(t, t))
-        return self._speak_village(st, rng)
+    def today_votes(self):
+        return [e for e in self.log if e.get("kind") == "vote"
+                and e.get("day") == self.day]
 
-    def _already_revealed(self, st, seat):
-        for s in st.my_speeches:
-            low = s["text"].lower()
-            if ("seer" in low and str(seat) in low) or (st.names.get(seat, "").lower() in low and "seer" in low):
-                return True
-        return False
+    def vote_leader(self):
+        counts = {}
+        for v in self.today_votes():
+            if v.get("target") is not None:
+                counts[v["target"]] = counts.get(v["target"], 0) + 1
+        if not counts:
+            return None, 0
+        top = max(counts.values())
+        leaders = [s for s, c in counts.items() if c == top]
+        return (leaders[0] if len(leaders) == 1 else None), top
 
-    def _speak_wolf(self, st, rng):
-        order, scores, reasons = rank_suspects(st, for_wolf=True)
-        # defend myself when under attack (same words a villager would use)
-        self_def = self._defend_self(st, rng)
-        if self_def:
-            return self_def
-        # defend partner if accused and the case is weak
-        if st.partner in st.living:
-            accusers = [e["seat"] for e in st.speeches if e["seat"] != st.my_seat and st.partner == st._seat_from_text(e["text"])]
-            votes_on_partner = len(st.votes_for(st.partner, st.day))
-            if accusers and votes_on_partner == 0 and rng.random() < 0.5:
-                return rng.choice(DEFEND_TEMPLATES).format(s=st.partner, n=st.names.get(st.partner, st.partner), o=(order[0][0] if order else st.partner), why="Their votes look village to me.")
-        if not order:
-            return self._neutral(st, rng)
-        top, top_score = order[0]
-        # as a wolf, accuse the most exilable villager
-        return rng.choice(ACCUSE_TEMPLATES).format(s=top, n=st.names.get(top, top), why=reason_text(st, top, reasons))
+    def name_of(self, seat):
+        return self.name.get(seat, "?")
 
-    def _neutral(self, st, rng):
-        dead = st.deaths.get(st.day)
-        if st.day == 1:
-            if dead:
-                order, _, _ = rank_suspects(st)
-                s = order[0][0] if order else (st.living[0] if st.living else 1)
-                return rng.choice(DAY1_TEMPLATES).format(d=dead["seat"], s=s, n=st.names.get(s, s))
-            return rng.choice(DAY1_NO_DEATH)
-        if dead:
-            return f"Seat {dead['seat']} is gone and they were village. The wolves are among us, let us watch the votes today."
-        return rng.choice(NO_DEATH_TEMPLATES)
 
-    # -- vote ---------------------------------------------------------------
-    def decide_vote(self, p, st):
-        game = p.get("game")
-        options = p.get("options") or [s for s in st.living if s != st.my_seat]
-        if not options:
-            return {"game": game, "decision": "vote", "target": None}
-        if st.my_role == "werewolf":
-            target = self._vote_wolf(st, options)
-        else:
-            target = self._vote_village(st, options)
-        return {"game": game, "decision": "vote", "target": target}
+def decide_kill(st, options):
+    """Wolf night kill. options: living non-wolves."""
+    if not options:
+        return None
+    rng = st.rng("kill")
+    # 1. match the partner's pick this night
+    for v in (st.view.get("wolfVotes") or []):
+        if v.get("night") == st.day and v.get("seat") != st.me \
+                and v.get("target") in options:
+            return v["target"]
+    # 2. seer claimants first
+    cands = [s for s in options if s in st.seer_claimants]
+    if cands:
+        return rng.choice(sorted(cands))
+    # 3. players who accused me or my partner
+    accusers = {a for (a, t) in st.accusations
+                if t in (st.me, st.partner)}
+    cands = [s for s in options if s in accusers]
+    if cands:
+        return rng.choice(sorted(cands))
+    # 4. loudest villager (most speeches naming a wolf), else most suspicious
+    loud = sorted(options, key=lambda s: (-st.accuse_count.get(s, 0),
+                                          -st.speech_count.get(s, 0), s))
+    if loud and st.accuse_count.get(loud[0], 0) > 0:
+        return loud[0]
+    sus = sorted(options, key=lambda s: (-st.suspicion.get(s, 0), s))
+    return sus[0]
 
-    def _vote_village(self, st, options):
-        order, scores, reasons = rank_suspects(st)
-        order = [(s, sc) for s, sc in order if s in options]
-        if not order:
-            return None
-        # known wolf first
-        known = [s for s, sc in order if sc >= 100.0]
-        if known:
-            return known[0]
-        top, top_score = order[0]
-        # weak evidence and enough villagers left: abstain rather than help
-        # exile a villager at random. With 4 or fewer alive the village must
-        # exile the wolf today, so vote anyway. Exception: if the current
-        # leader is a likely villager, vote my top suspect to try to tie and
-        # block the bad exile (abstaining would let it happen).
-        if top_score < 1.0 and len(st.living) >= 5:
-            counts = {}
-            for v in st.current_day_votes():
-                if v.get("target") is not None:
-                    counts[v["target"]] = counts.get(v["target"], 0) + 1
-            if counts:
-                leader = max(sorted(counts.items()), key=lambda kv: kv[1])[0]
-                leader_score = scores.get(leader, -99)
-                if leader in options and leader_score >= 1.0 and leader in [s for s, _ in order[:3]]:
-                    return leader
-                if leader in options and leader_score <= -1.0:
+
+def decide_protect(st, options):
+    """Doctor night protect. options exclude self and last night's target."""
+    if not options:
+        return None
+    rng = st.rng("protect")
+    # 1. seer claimant first; prefer one whose named wolf looks real
+    claimants = [s for s in options if s in st.seer_claimants]
+    if claimants:
+        def claim_value(s):
+            for c in st.claims:
+                if c["seat"] == s and c.get("wolf") is not None:
+                    return st.suspicion.get(c["wolf"], 0)
+            return 0.0
+        claimants.sort(key=lambda s: (-claim_value(s), s))
+        return claimants[0]
+    # 2. loudest accuser (most speeches naming a wolf)
+    loud = sorted(options, key=lambda s: (-st.accuse_count.get(s, 0),
+                                          -st.speech_count.get(s, 0), s))
+    if loud and st.accuse_count.get(loud[0], 0) > 0:
+        return loud[0]
+    # 3. a seer-vouched villager
+    vouched = [s for s in options if s in st.known_villagers]
+    if vouched:
+        return rng.choice(sorted(vouched))
+    # 4. deterministic pick among the living
+    return rng.choice(sorted(options))
+
+
+def decide_inspect(st, options):
+    """Seer night inspect: most suspicious unchecked living player."""
+    if not options:
+        return None
+    checked = {r.get("seat") for r in (st.view.get("seerResults") or [])}
+    cands = [s for s in options if s not in checked]
+    if not cands:
+        cands = list(options)
+    cands.sort(key=lambda s: (-st.suspicion.get(s, 0), s))
+    return cands[0]
+
+
+def _known_wolf_target(st, options):
+    for t in sorted(st.known_wolves):
+        if t in options and t in st.alive:
+            return t
+    lone = st.lone_seer_target()
+    if lone is not None and lone in options:
+        return lone
+    return None
+
+
+def decide_vote(st, options):
+    """Day vote. options exclude self."""
+    if not options:
+        return None
+    if st.role == "werewolf":
+        return _wolf_vote(st, options)
+    # village side
+    wolf = _known_wolf_target(st, options)
+    if wolf is not None:
+        return wolf
+    top = st.top_suspect()
+    if top is not None and top in options:
+        score = st.suspicion.get(top, 0)
+        if score >= 1.0 or len(st.alive) <= 5:
+            # At 5 alive with 2 wolves, no exile means a night kill brings
+            # parity at dawn, so the village must take its best shot.
+            return top
+        # weak evidence: try to tie/block a bad exile
+        leader, nlead = st.vote_leader()
+        if leader is not None and leader != top:
+            if st.suspicion.get(leader, 0) < 0.5 and score >= 0.5:
+                # vote top suspect only if it can tie the leader
+                counts = {}
+                for v in st.today_votes():
+                    if v.get("target") is not None:
+                        counts[v["target"]] = counts.get(v["target"], 0) + 1
+                if counts.get(top, 0) + 1 >= nlead:
                     return top
-            return None
-        # current plurality
-        counts = {}
-        for v in st.current_day_votes():
-            if v.get("target") is not None:
-                counts[v["target"]] = counts.get(v["target"], 0) + 1
-        if counts:
-            leader = max(sorted(counts.items()), key=lambda kv: kv[1])[0]
-            leader_score = scores.get(leader, -99)
-            # join the leader only if they are a plausible wolf
-            if leader in options and leader_score >= 1.0 and leader in [s for s, _ in order[:3]]:
-                return leader
-            # if the leader is a trusted villager, do not join: vote my suspect
-            if leader_score <= -1.0:
-                return top
-        return top
+        return None  # abstain rather than exile a random villager
+    return None
 
-    def _vote_wolf(self, st, options):
-        # bus a doomed partner
-        if st.partner in st.living:
-            counts = {}
-            for v in st.current_day_votes():
-                if v.get("target") is not None:
-                    counts[v["target"]] = counts.get(v["target"], 0) + 1
-            pv = counts.get(st.partner, 0)
-            if pv >= 3:
-                return st.partner
-        order, scores, reasons = rank_suspects(st, for_wolf=True)
-        order = [(s, sc) for s, sc in order if s in options and s != st.partner]
-        if not order:
-            return None
-        counts = {}
-        for v in st.current_day_votes():
-            if v.get("target") is not None:
-                counts[v["target"]] = counts.get(v["target"], 0) + 1
-        # bandwagon: a villager already leading with votes is the best push
-        if counts:
-            leader = max(sorted(counts.items()), key=lambda kv: kv[1])[0]
-            if leader in options and leader != st.partner:
-                return leader
-        return order[0][0]
 
-    # -- night: kill ----------------------------------------------------------
-    def decide_kill(self, p, st):
-        game = p.get("game")
-        options = p.get("options") or []
-        if not options:
-            return {"game": game, "decision": "kill", "target": None}
-        # coordinate: if partner already voted, match them
-        mine = [v for v in st.wolf_votes if v["night"] == st.day and v["seat"] == st.partner and v.get("target") is not None]
-        if mine:
-            t = mine[0]["target"]
-            if t in options:
-                return {"game": game, "decision": "kill", "target": t}
-        # first voter: pick the most obvious target so the partner agrees
-        rng = self.rng(game, f"kill-d{st.day}")
-        claimants = [s for s in st.seer_claimants() if s in options]
-        if claimants:
-            return {"game": game, "decision": "kill", "target": rng.choice(sorted(claimants))}
-        # a player who accused me or my partner
-        accusers = set()
-        for e in st.speeches:
-            if e["seat"] in options:
-                low = e["text"].lower()
-                if "not a wolf" in low or "isn't a wolf" in low:
-                    continue
-                tgt = st._seat_from_text(e["text"])
-                if tgt in (st.my_seat, st.partner) and "wolf" in low:
-                    accusers.add(e["seat"])
-        if accusers:
-            return {"game": game, "decision": "kill", "target": rng.choice(sorted(accusers))}
-        # loudest villager (most speeches)
-        loud = sorted(options, key=lambda s: (-st.speech_count(s), s))
-        if loud and st.speech_count(loud[0]) >= 2:
-            return {"game": game, "decision": "kill", "target": loud[0]}
-        return {"game": game, "decision": "kill", "target": rng.choice(sorted(options))}
+def _wolf_vote(st, options):
+    """Wolf day vote: most exilable villager; bus a doomed partner only."""
+    villagers = [s for s in options if s != st.partner]
+    if not villagers:
+        return st.partner if st.partner in options else None
+    # partner doomed? votes already cast against partner >= 2 and partner
+    # is the clear leader, or suspicion on partner is very high
+    counts = {}
+    for v in st.today_votes():
+        if v.get("target") is not None:
+            counts[v["target"]] = counts.get(v["target"], 0) + 1
+    if st.partner in options:
+        p_votes = counts.get(st.partner, 0)
+        p_sus = st.suspicion.get(st.partner, 0)
+        leader, nlead = st.vote_leader()
+        if leader == st.partner and p_votes >= 2 and p_sus >= 3.0:
+            return st.partner  # bus: partner is going out anyway
+    # join a plausible plurality on a villager
+    leader, nlead = st.vote_leader()
+    if leader is not None and leader in villagers \
+            and st.suspicion.get(leader, 0) >= 0.5:
+        return leader
+    # most exilable villager = highest suspicion
+    villagers.sort(key=lambda s: (-st.suspicion.get(s, 0), s))
+    return villagers[0]
 
-    # -- night: protect ---------------------------------------------------------
-    def decide_protect(self, p, st):
-        game = p.get("game")
-        options = p.get("options") or []
-        if not options:
-            return {"game": game, "decision": "protect", "target": None}
-        rng = self.rng(game, f"protect-d{st.day}")
-        # Wolves kill in this order: seer claimants, then the loudest accuser
-        # (most speeches naming a wolf), then anyone. Protect in that order,
-        # preferring likely villagers (a wolf will never be the wolves' target).
-        _, scores, _ = rank_suspects(st)
-        likely_villager = [s for s in options if scores.get(s, 0) < 1.0]
-        pool = likely_villager if likely_villager else options
-        # seer claimant first; prefer the claimant whose named wolf looks
-        # like a real wolf (that claim is the most likely true)
-        claimants = [s for s in st.seer_claimants() if s in pool]
-        if claimants:
-            def claimer_rank(s):
-                for c in st.claims:
-                    if c.get("seat") == s and c.get("kind") == "seer" and c.get("result") == "wolf":
-                        return -scores.get(c.get("target"), 0)
-                return 0.0
-            claimants.sort(key=lambda s: (claimer_rank(s), s))
-            return {"game": game, "decision": "protect", "target": claimants[0]}
-        # loudest accuser: most speeches naming a wolf
-        loud = sorted(pool, key=lambda s: (-st.wolf_mention_count(s), s))
-        if loud and st.wolf_mention_count(loud[0]) >= 1:
-            return {"game": game, "decision": "protect", "target": loud[0]}
-        # a villager vouched by a trusted seer
-        vouched = [s for s in (st.claimed_villager_by_trusted() | st.known_villager) if s in pool]
-        if vouched:
-            return {"game": game, "decision": "protect", "target": rng.choice(sorted(vouched))}
-        return {"game": game, "decision": "protect", "target": rng.choice(sorted(pool))}
 
-    # -- night: inspect -----------------------------------------------------------
-    def decide_inspect(self, p, st):
-        game = p.get("game")
-        options = p.get("options") or []
-        if not options:
-            return {"game": game, "decision": "inspect", "target": None}
-        order, scores, reasons = rank_suspects(st)
-        checked = {r["seat"] for r in st.seer_results}
-        for s, _ in order:
-            if s in options and s not in checked:
-                return {"game": game, "decision": "inspect", "target": s}
-        return {"game": game, "decision": "inspect", "target": None}
+# ---------------------------------------------------------------- speech
+def _voted_wolf_out(st):
+    """Did I vote for a player later revealed as a wolf?"""
+    for e in st.log:
+        if e.get("kind") == "exile" and e.get("role") == "werewolf":
+            for v in st.log:
+                if v.get("kind") == "vote" and v.get("day") == e.get("day") \
+                        and v.get("seat") == st.me \
+                        and v.get("target") == e.get("seat"):
+                    return True
+    return False
+
+
+def decide_speak(st):
+    """Return a statement string, or None to pass."""
+    rng = st.rng("speak")
+    # --- seer with a fresh wolf result: reveal at once
+    if st.role == "seer":
+        wolves = [r for r in (st.view.get("seerResults") or [])
+                  if r.get("werewolf") and r.get("seat") in st.alive]
+        if wolves:
+            t = wolves[0]["seat"]
+            return ("I am the seer. I checked seat %d (%s) last night: wolf. "
+                    "Vote seat %d out." % (t, st.name_of(t), t))
+        cleared = [r["seat"] for r in (st.view.get("seerResults") or [])
+                   if not r.get("werewolf") and r.get("seat") in st.alive]
+        # Never announce a clear: naming myself as seer with no wolf found
+        # only tells the wolves who to kill, and the clear is already used
+        # privately (known_villagers feeds votes and doctor logic).
+    # --- echo a lone seer claim (any village role, and wolf faking support)
+    lone = st.lone_seer_target()
+    if lone is not None and st.role != "werewolf":
+        return ("Seat %d (%s) is named as a wolf by the seer. "
+                "I agree, vote seat %d out."
+                % (lone, st.name_of(lone), lone))
+    if lone is not None and st.role == "werewolf":
+        # as a wolf, echoing a true claim about a villager helps; but a lone
+        # claim here names a real wolf only if the claimant is honest, which
+        # would be my partner or me -- never echo that.
+        if lone not in st.known_wolves:
+            return ("Seat %d (%s) is named as a wolf by the seer. "
+                    "I agree, vote seat %d out."
+                    % (lone, st.name_of(lone), lone))
+    # --- village: accuse top suspect when evidence is real
+    if st.role != "werewolf":
+        top = st.top_suspect()
+        if top is not None and st.suspicion.get(top, 0) >= 1.0:
+            reasons = [
+                "Seat %d (%s) voted for a villager who was exiled. That points at a wolf.",
+                "Seat %d (%s) keeps pushing villagers. I do not trust them.",
+                "Seat %d (%s) looks off to me. Their votes do not help the village.",
+            ]
+            return rng.choice(reasons) % (top, st.name_of(top))
+        if rng.random() < 0.35:
+            return None  # pass quietly on a thin day
+        neutrals = [
+            "No strong read yet. I am watching the votes today.",
+            "Let us not rush. A wrong exile helps the wolves.",
+            "I have nothing solid yet. Listening for now.",
+        ]
+        return rng.choice(neutrals)
+    # --- wolf: accuse the most exilable villager, defend self/partner weakly
+    top = st.top_suspect()
+    if top is not None and st.suspicion.get(top, 0) >= 0.5:
+        reasons = [
+            "Seat %d (%s) voted for a villager who was exiled. That is a wolf move.",
+            "I think seat %d (%s) is hiding something. Their votes keep landing on villagers.",
+            "Seat %d (%s) has been too quiet when villagers die. Watch them.",
+        ]
+        return rng.choice(reasons) % (top, st.name_of(top))
+    if _voted_wolf_out(st):
+        return "I voted out a wolf before. I am on the village side, listen to the votes."
+    if rng.random() < 0.4:
+        return None
+    return "No strong read yet. I am watching the votes today."
+
+
+# ---------------------------------------------------------------- main loop
+def decide(st, decision, options, max_chars):
+    if decision == "kill":
+        return ("target", decide_kill(st, options or []))
+    if decision == "protect":
+        return ("target", decide_protect(st, options or []))
+    if decision == "inspect":
+        return ("target", decide_inspect(st, options or []))
+    if decision == "vote":
+        return ("target", decide_vote(st, options or []))
+    if decision == "speak":
+        text = decide_speak(st)
+        if text is None:
+            return ("pass", True)
+        return ("text", text[:max_chars] if max_chars else text[:500])
+    return ("target", None)
 
 
 def main():
-    env_url = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
-    seed = os.environ.get("MAKEFUN_TRIAL_SEED", "")
-    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE", "")
-    if not env_url:
-        sys.stderr.write("werewolf: MAKEFUN_ENV_URL is not set\n")
-        return 1
+    env_url = os.environ.get("MAKEFUN_ENV_URL", "http://127.0.0.1:8901")
+    trial_seed = os.environ.get("MAKEFUN_TRIAL_SEED", "default-seed")
+    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE")
     if prompt_file:
         try:
             with open(prompt_file, "r", encoding="utf-8") as f:
-                f.read()
-        except OSError as err:
-            sys.stderr.write(f"werewolf: cannot read prompt file: {err}\n")
-    agent = Agent(env_url, seed)
-    try:
-        decisions, fallbacks = agent.run()
-    except Exception as err:  # noqa: BLE001 - never stall the trial
-        sys.stderr.write(f"werewolf: {err}\n")
-        return 1
-    print(f"werewolf: {decisions} decisions, {fallbacks} fallbacks; trial done")
+                f.read(1)
+        except Exception:
+            pass
+    env = Env(env_url)
+    while True:
+        status, obs = env.observe()
+        if status == 0:
+            # env unreachable for now; retry via a fresh observe
+            continue
+        if obs.get("done"):
+            return 0
+        pending = obs.get("pending") or []
+        if not pending:
+            if obs.get("done"):
+                return 0
+            continue
+        progressed = False
+        for item in pending:
+            game = item.get("game")
+            decision = item.get("decision")
+            view = item.get("view") or {}
+            options = item.get("options")
+            max_chars = item.get("max_chars") or 500
+            st = State(view, trial_seed, game_num=game or 0)
+            if not st.alive or st.me is None:
+                continue
+            kind, value = decide(st, decision, options, max_chars)
+            if kind == "target":
+                status2, _ = env.act(game, decision, target=value)
+            elif kind == "pass":
+                status2, _ = env.act(game, decision, is_pass=True)
+            else:
+                status2, _ = env.act(game, decision, text=value)
+            if status2 in (200, 409, 400):
+                progressed = True
+        if not progressed:
+            # nothing could be answered; observe again (env may advance)
+            continue
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
